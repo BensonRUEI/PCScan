@@ -3,6 +3,7 @@ import csv
 import html as html_mod
 import os
 import platform
+import re
 import sys
 import zipfile
 
@@ -15,6 +16,14 @@ try:
     HAS_XLSXWRITER = True
 except ImportError:
     HAS_XLSXWRITER = False
+
+try:
+    from cveScanner import scanPrograms, getDbStats, DB_DEFAULT
+    from cveScanner.repology import fetchLatestVersions
+    HAS_CVE_SCANNER = True
+except ImportError:
+    HAS_CVE_SCANNER = False
+    fetchLatestVersions = None
 
 from collector import (
     get_local_ip_address,
@@ -49,6 +58,39 @@ def exportXlsx(sheets, filename):
             for col, field in enumerate(fieldOrder):
                 ws.write(rowIdx, col, _normalize(item.get(field, "")), cellFmt)
     wb.close()
+
+# ── CPE 2.3 Helpers（VANS 需求）───────────────────────────────────────────
+
+def _cpe_component(value: str) -> str:
+    """Normalize a string to CPE 2.3 vendor/product component."""
+    if not value or not value.strip():
+        return '*'
+    v = value.lower().strip()
+    v = re.sub(r'[^a-z0-9._\-]+', '_', v)
+    v = re.sub(r'_+', '_', v).strip('_')
+    return v or '*'
+
+def _cpe_product(name: str) -> str:
+    """Normalize display name to CPE 2.3 product, stripping trailing version suffix."""
+    if not name or not name.strip():
+        return '*'
+    n = name.lower().strip()
+    n = re.sub(r'\s+v?\d[\d.\-_]*\s*$', '', n).strip()
+    n = re.sub(r'[^a-z0-9._\-]+', '_', n)
+    n = re.sub(r'_+', '_', n).strip('_')
+    return n or '*'
+
+def _cpe_version(value: str) -> str:
+    """Normalize version string to CPE 2.3 version component."""
+    if not value or not value.strip():
+        return '*'
+    v = re.sub(r'[^a-zA-Z0-9._\-]+', '_', value.strip()).strip('_')
+    return v or '*'
+
+def make_cpe23(name: str, version: str, publisher: str) -> str:
+    """Build a CPE 2.3 formatted string (part=a) for an installed application."""
+    return f"cpe:2.3:a:{_cpe_component(publisher)}:{_cpe_product(name)}:{_cpe_version(version)}:*:*:*:*:*:*:*"
+
 
 def exportCsv(sheets, baseName, outDir):
     filenames = []
@@ -91,11 +133,49 @@ def main():
     passwordPolicy  = get_password_policy()
     networkSettings = get_network_settings()
 
+    # 查詢各軟體最新版本（Repology）
+    if HAS_CVE_SCANNER and fetchLatestVersions:
+        print(f"查詢 {len(programs)} 個已安裝程式的最新版本（Repology）...")
+        programNames = [p.get("名稱 / Name", "") for p in programs]
+        latestMap    = fetchLatestVersions(programNames)
+        for p in programs:
+            p["最新版本 / Latest"] = latestMap.get(p.get("名稱 / Name", ""), "")
+    else:
+        for p in programs:
+            p["最新版本 / Latest"] = ""
+
+    # CPE 2.3 清單（VANS 需求）
+    for p in programs:
+        p["CPE 2.3"] = make_cpe23(
+            p.get("名稱 / Name", ""),
+            p.get("版本 / Version", ""),
+            p.get("發行者 / Publisher", ""),
+        )
+    cpe23File = os.path.join(outDir, f"{baseName}_CPE23.txt")
+    with open(cpe23File, "w", encoding="utf-8", newline="\n") as f:
+        for p in programs:
+            f.write(p["CPE 2.3"] + "\n")
+    print(f"CPE 2.3 清單已匯出至 {cpe23File}")
+
+    # CVE 風險掃描（離線，需先用 nvdIndexer.py 建立索引）
+    cveResults = []
+    if HAS_CVE_SCANNER:
+        dbStats = getDbStats(DB_DEFAULT)
+        if dbStats["exists"] and dbStats["cveCount"] > 0:
+            print(f"掃描 CVE 風險中（資料庫：{dbStats['cveCount']:,} 筆 CVE）...")
+            cveResults = scanPrograms(programs)
+            print(f"  發現 {len(cveResults)} 筆潛在 CVE 風險")
+        else:
+            print("CVE 掃描跳過（NVD 資料庫尚未建立，請執行 python nvdIndexer.py）")
+    else:
+        print("CVE 掃描跳過（cveScanner 模組不可用）")
+
     # 產生 HTML 內容
     htmlContent = generateHtml(
         computerName, localIp,
         systemInfo, defenderInfo, updates,
-        programs, userAccounts, passwordPolicy, networkSettings
+        programs, userAccounts, passwordPolicy, networkSettings,
+        cveResults=cveResults,
     )
 
     # 寫入 HTML 檔案
@@ -116,10 +196,13 @@ def main():
         ("Windows Defender", defenderInfo,    ["產品版本 / AMProductVersion", "服務版本 / AMServiceVersion",
                                                 "防間諜簽章版本 / AntispywareSignatureVersion", "防毒簽章版本 / AntivirusSignatureVersion"]),
         ("已安裝更新",       updates,          ["更新編號 / HotFixID", "描述 / Description", "安裝日期 / InstalledOn"]),
-        ("已安裝程式",       programs,         ["名稱 / Name", "版本 / Version", "發行者 / Publisher"]),
+        ("已安裝程式",       programs,         ["名稱 / Name", "版本 / Version", "最新版本 / Latest", "發行者 / Publisher", "CPE 2.3"]),
         ("使用者帳號",       userAccounts,    ["帳號名稱 / Username", "網域 / Domain", "描述 / Description", "是否啟用 / Enabled"]),
         ("密碼原則",         passwordPolicy,  ["設定 / Setting", "值 / Value"]),
         ("網路設定",         networkSettings, ["介面名稱 / Interface", "IP 位址 / IP Address", "子網遮罩 / Subnet Mask", "DNS 伺服器 / DNS Server"]),
+        ("CVE 風險",         cveResults,      ["軟體名稱 / Software", "已安裝版本 / Version", "CVE ID",
+                                               "CVSS 分數 / Score", "嚴重等級 / Severity",
+                                               "受影響版本範圍 / Range", "描述 / Description"]),
     ]
     if HAS_XLSXWRITER:
         xlsxFile = os.path.join(outDir, f"{baseName}.xlsx")
@@ -140,7 +223,8 @@ def main():
     print(f"已壓縮至 {zipPath}")
 
 def generateHtml(computerName, localIp, systemInfo, defenderInfo, updates,
-                  programs, userAccounts, passwordPolicy, networkSettings):
+                  programs, userAccounts, passwordPolicy, networkSettings,
+                  cveResults=None):
     """
     產生 HTML 格式的報告 (使用 Bootstrap 5)
     並在頁面上方加入導覽列 (Navbar)，可快速跳轉到各區段。
@@ -161,6 +245,10 @@ def generateHtml(computerName, localIp, systemInfo, defenderInfo, updates,
     html.append("h2 { margin-top: 20px; }")
     html.append("table { width: 100%; margin-bottom: 20px; }")
     html.append("th { cursor: pointer; }")
+    html.append(".severity-critical { background-color: #f8d7da !important; }")
+    html.append(".severity-high     { background-color: #fff3cd !important; }")
+    html.append(".severity-medium   { background-color: #cff4fc !important; }")
+    html.append(".severity-low      { background-color: #d1e7dd !important; }")
     html.append("</style>")
     html.append("</head>")
     html.append("<body>")
@@ -184,6 +272,7 @@ def generateHtml(computerName, localIp, systemInfo, defenderInfo, updates,
         <li class="nav-item"><a class="nav-link" href="#users">使用者帳號</a></li>
         <li class="nav-item"><a class="nav-link" href="#policy">密碼原則</a></li>
         <li class="nav-item"><a class="nav-link" href="#network">網路設定</a></li>
+        <li class="nav-item"><a class="nav-link" href="#cve">CVE 風險</a></li>
       </ul>
     </div>
   </div>
@@ -206,6 +295,7 @@ def generateHtml(computerName, localIp, systemInfo, defenderInfo, updates,
     html.append(generateHtmlSection("使用者帳號", userAccounts, "users"))
     html.append(generateHtmlSection("密碼原則", passwordPolicy, "policy"))
     html.append(generateHtmlSection("網路設定", networkSettings, "network"))
+    html.append(generateCveSection(cveResults or []))
 
     html.append("</div></div></div>")  # end of container, row, col
 
@@ -281,7 +371,7 @@ def generateHtmlSection(title, data, tableId):
         html.append("<thead class='table-light'><tr>")
         for i, header in enumerate(headers):
             html.append(
-                f"<th onclick=\"sortTable('{safeTid}_table', {i})\">")
+                f"<th onclick=\"sortTable('{safeTid}_table', {i})\">"
                 f"{html_mod.escape(str(header))}</th>"
             )
         html.append("</tr></thead>")
@@ -294,7 +384,17 @@ def generateHtmlSection(title, data, tableId):
                     val = val.get("DateTime", str(val))
                 elif isinstance(val, list):
                     val = ", ".join(str(v) for v in val)
-                html.append(f"<td>{html_mod.escape(str(val))}</td>")
+                if header == "最新版本 / Latest":
+                    latest    = str(val)
+                    installed = str(item.get("版本 / Version", ""))
+                    if not latest:
+                        html.append("<td><span class='text-muted'>—</span></td>")
+                    elif installed == latest:
+                        html.append(f"<td><span class='text-success fw-bold'>{html_mod.escape(latest)}</span></td>")
+                    else:
+                        html.append(f"<td><span class='text-warning fw-bold'>{html_mod.escape(latest)} &#x2B06;</span></td>")
+                else:
+                    html.append(f"<td>{html_mod.escape(str(val))}</td>")
             html.append("</tr>")
         html.append("</tbody>")
         html.append("</table>")
@@ -302,6 +402,82 @@ def generateHtmlSection(title, data, tableId):
         for item in data:
             html.append(f"<p>{html_mod.escape(str(item))}</p>")
 
+    html.append("</div>")
+    return "\n".join(html)
+
+
+def generateCveSection(cveResults: list) -> str:
+    """
+    產生 CVE 風險區段，以不同顏色標示嚴重等級。
+    CRITICAL=紅、HIGH=黃、MEDIUM=藍、LOW=綠
+    """
+    _SEVERITY_CLASS = {
+        "CRITICAL": "severity-critical",
+        "HIGH":     "severity-high",
+        "MEDIUM":   "severity-medium",
+        "LOW":      "severity-low",
+    }
+    _SEVERITY_BADGE = {
+        "CRITICAL": "bg-danger",
+        "HIGH":     "bg-warning text-dark",
+        "MEDIUM":   "bg-info text-dark",
+        "LOW":      "bg-success",
+    }
+
+    html = []
+    html.append("<div class='section' id='cve'>")
+    html.append("<h2>CVE 風險掃描結果</h2>")
+
+    if not cveResults:
+        html.append(
+            "<div class='alert alert-secondary'>")
+        html.append(
+            "未偵測到 CVE 風險，或 NVD 資料庫尚未建立。"
+            "<br>請執行 <code>python nvdIndexer.py &lt;nvdcve-2.0-YYYY.json.zip&gt;</code> 建立索引後重新執行。"
+        )
+        html.append("</div>")
+        html.append("</div>")
+        return "\n".join(html)
+
+    # 嚴重等級統計徽章
+    from collections import Counter
+    severityCounts = Counter(
+        r["嚴重等級 / Severity"].upper() for r in cveResults
+    )
+    html.append("<p>")
+    for sev in ("CRITICAL", "HIGH", "MEDIUM", "LOW"):
+        count = severityCounts.get(sev, 0)
+        if count:
+            badgeCls = _SEVERITY_BADGE.get(sev, "bg-secondary")
+            html.append(f"<span class='badge {badgeCls} me-2'>{sev}: {count}</span>")
+    html.append(f"<small class='text-muted'>共 {len(cveResults)} 筆</small>")
+    html.append("</p>")
+
+    # 表格
+    headers = ["軟體名稱 / Software", "已安裝版本 / Version", "CVE ID",
+               "CVSS 分數 / Score", "嚴重等級 / Severity",
+               "受影響版本範圍 / Range", "描述 / Description"]
+    html.append("<div class='table-responsive'>")
+    html.append("<table class='table table-bordered table-sm' id='cve_table'>")
+    html.append("<thead class='table-dark'><tr>")
+    for i, h in enumerate(headers):
+        html.append(
+            f"<th onclick=\"sortTable('cve_table', {i})\">"
+            f"{html_mod.escape(h)}</th>"
+        )
+    html.append("</tr></thead>")
+    html.append("<tbody>")
+    for row in cveResults:
+        sev      = row.get("嚴重等級 / Severity", "").upper()
+        rowClass = _SEVERITY_CLASS.get(sev, "")
+        html.append(f"<tr class='{rowClass}'>")
+        for h in headers:
+            val = row.get(h, "")
+            html.append(f"<td>{html_mod.escape(str(val))}</td>")
+        html.append("</tr>")
+    html.append("</tbody>")
+    html.append("</table>")
+    html.append("</div>")
     html.append("</div>")
     return "\n".join(html)
 

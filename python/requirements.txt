@@ -1,1 +1,2 @@
 xlsxwriter  # 選用：有安裝時輸出 .xlsx，否則自動回退 CSV
+packaging   # CVE 版本比對（用於 cveScanner.py）

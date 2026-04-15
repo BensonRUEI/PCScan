@@ -22,21 +22,11 @@ if ($PSVersionTable.PSVersion.Major -ge 6) {
 }
 
 Add-Type -AssemblyName System.Web
+. (Join-Path $PSScriptRoot 'NvdLib.ps1')
 
 # ===========================================================================
 # Helper functions
 # ===========================================================================
-
-function Get-LocalIPv4 {
-    # 回傳第一個非 127.x IPv4（用於資料夾/ZIP 命名）
-    $hn = [System.Net.Dns]::GetHostName()
-    foreach ($a in [System.Net.Dns]::GetHostAddresses($hn)) {
-        if ($a.AddressFamily -eq 'InterNetwork' -and -not $a.ToString().StartsWith('127.')) {
-            return $a.ToString()
-        }
-    }
-    return 'Unknown'
-}
 
 function Get-AllLocalIPv4 {
     # 回傳所有非 127.x / 169.254.x IPv4，以逗號分隔
@@ -66,16 +56,17 @@ function Nz([object]$v) {
 # Build HTML table from PSObject array
 function To-HtmlTable {
     param([object[]]$Data, [string]$Id)
-    if (-not $Data -or $Data.Count -eq 0) { return '<p>No data</p>' }
+    if (-not $Data -or $Data.Count -eq 0) { return '<p>無資料</p>' }
     $cols = $Data[0].PSObject.Properties.Name
+    $tableId = "${Id}_table"
     $sb = New-Object System.Text.StringBuilder
     $null = $sb.Append('<div class="table-responsive"><table id="')
-    $null = $sb.Append($Id)
-    $null = $sb.Append('" class="table table-bordered table-striped table-hover table-sm"><thead class="table-dark"><tr>')
+    $null = $sb.Append($tableId)
+    $null = $sb.Append('" class="table table-bordered table-sm"><thead class="table-light"><tr>')
     $ci = 0
     foreach ($c in $cols) {
         $null = $sb.Append('<th onclick="sortTable(''')
-        $null = $sb.Append($Id)
+        $null = $sb.Append($tableId)
         $null = $sb.Append(''',')
         $null = $sb.Append($ci)
         $null = $sb.Append(')">')
@@ -86,10 +77,22 @@ function To-HtmlTable {
     $null = $sb.Append('</tr></thead><tbody>')
     foreach ($row in $Data) {
         $null = $sb.Append('<tr>')
+        $instVer = Nz $row.'版本 / Version'
         foreach ($c in $cols) {
-            $null = $sb.Append('<td>')
-            $null = $sb.Append((Esc (Nz $row.$c)))
-            $null = $sb.Append('</td>')
+            $val = Nz $row.$c
+            if ($c -eq '最新版本 / Latest') {
+                if (-not $val) {
+                    $null = $sb.Append('<td><span class="text-muted">—</span></td>')
+                } elseif ($val -eq $instVer) {
+                    $null = $sb.Append("<td><span class='text-success fw-bold'>$(Esc $val)</span></td>")
+                } else {
+                    $null = $sb.Append("<td><span class='text-warning fw-bold'>$(Esc $val) ⬆</span></td>")
+                }
+            } else {
+                $null = $sb.Append('<td>')
+                $null = $sb.Append((Esc $val))
+                $null = $sb.Append('</td>')
+            }
         }
         $null = $sb.Append('</tr>')
     }
@@ -175,11 +178,14 @@ function Get-AntivirusInfo {
 function Get-InstalledUpdates {
     if ($IsWin) {
         try {
-            return Get-HotFix -ErrorAction Stop | ForEach-Object {
+            return Get-HotFix -ErrorAction Stop |
+                Sort-Object { try { [datetime]$_.InstalledOn } catch { [datetime]::MinValue } } -Descending |
+                Select-Object -First 10 |
+                ForEach-Object {
                 [PSCustomObject]@{
                     '更新編號 / HotFixID'    = Nz $_.HotFixID
                     '描述 / Description'     = Nz $_.Description
-                    '安裝日期 / InstalledOn'  = if ($_.InstalledOn) { $_.InstalledOn.ToString('yyyy-MM-dd') } else { '' }
+                    '安裝日期 / InstalledOn'  = try { ([datetime]$_.InstalledOn).ToString('yyyy-MM-dd') } catch { if ($_.InstalledOn) { [string]$_.InstalledOn } else { '' } }
                 }
             }
         } catch {
@@ -189,7 +195,7 @@ function Get-InstalledUpdates {
         if (Test-Path '/var/log/dpkg.log') {
             $lines = Get-Content '/var/log/dpkg.log' -ErrorAction SilentlyContinue |
                      Where-Object { $_ -match ' upgrade | install ' } |
-                     Select-Object -Last 100
+                     Select-Object -Last 10
             if ($lines) {
                 return $lines | ForEach-Object {
                     $p = $_ -split '\s+', 4
@@ -204,7 +210,7 @@ function Get-InstalledUpdates {
         }
         $yo = (& yum history list 2>$null)
         if ($yo) {
-            return $yo | Where-Object { $_ -match '^\s*\d+' } | Select-Object -First 50 | ForEach-Object {
+            return $yo | Where-Object { $_ -match '^\s*\d+' } | Select-Object -First 10 | ForEach-Object {
                 $cols = $_ -split '\|'
                 [PSCustomObject]@{
                     'ID'                   = $cols[0].Trim()
@@ -215,51 +221,6 @@ function Get-InstalledUpdates {
             }
         }
         return @([PSCustomObject]@{ '資訊 / Info' = 'Cannot retrieve (requires dpkg or yum)' })
-    }
-}
-
-function Get-InstalledPrograms {
-    if ($IsWin) {
-        $paths = @(
-            'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
-            'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
-            'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'
-        )
-        return $paths | ForEach-Object {
-            Get-ItemProperty $_ -ErrorAction SilentlyContinue
-        } | Where-Object { $_.DisplayName } |
-          Sort-Object DisplayName -Unique |
-          ForEach-Object {
-            [PSCustomObject]@{
-                '名稱 / Name'        = $_.DisplayName
-                '版本 / Version'     = if ($_.DisplayVersion) { $_.DisplayVersion } else { '' }
-                '發行者 / Publisher'  = if ($_.Publisher) { $_.Publisher } else { '' }
-            }
-        }
-    } else {
-        $dq = (& dpkg-query -W '-f=${Package}\t${Version}\t${Maintainer}\n' 2>$null)
-        if ($dq) {
-            return $dq | ForEach-Object {
-                $p = $_ -split '\t'
-                [PSCustomObject]@{
-                    '名稱 / Name'        = if ($p.Count -gt 0) { $p[0] } else { '' }
-                    '版本 / Version'     = if ($p.Count -gt 1) { $p[1] } else { '' }
-                    '發行者 / Publisher'  = if ($p.Count -gt 2) { $p[2] } else { '' }
-                }
-            }
-        }
-        $rq = (& rpm -qa '--queryformat=%{NAME}\t%{VERSION}-%{RELEASE}\t%{VENDOR}\n' 2>$null)
-        if ($rq) {
-            return $rq | ForEach-Object {
-                $p = $_ -split '\t'
-                [PSCustomObject]@{
-                    '名稱 / Name'        = if ($p.Count -gt 0) { $p[0] } else { '' }
-                    '版本 / Version'     = if ($p.Count -gt 1) { $p[1] } else { '' }
-                    '發行者 / Publisher'  = if ($p.Count -gt 2) { $p[2] } else { '' }
-                }
-            }
-        }
-        return @([PSCustomObject]@{ '名稱 / Name' = 'N/A'; '版本 / Version' = ''; '發行者 / Publisher' = '' })
     }
 }
 
@@ -436,6 +397,145 @@ function Get-OsDetails {
     }
 }
 
+
+# ===========================================================================
+# CVE Scan (native SQLite, no Python required)
+# ===========================================================================
+function Get-CveResults {
+    param([object[]]$Programs, [string]$DbPath)
+
+    if (-not (Test-Path $DbPath)) {
+        Write-Host '  CVE 掃描跳過（NVD 資料庫不存在，請先執行 .\nvdIndexer.ps1）' -ForegroundColor Yellow
+        return @()
+    }
+    if (-not (Initialize-SQLiteLib)) {
+        Write-Host '  CVE 掃描跳過（SQLite 無法載入）' -ForegroundColor Yellow
+        return @()
+    }
+    $stats = Get-NvdDbStats $DbPath
+    if (-not $stats.exists -or $stats.cveCount -eq 0) {
+        Write-Host '  CVE 掃描跳過（NVD 資料庫空白，請先執行 .\nvdIndexer.ps1）' -ForegroundColor Yellow
+        return @()
+    }
+    Write-Host "  NVD 資料庫：$($stats.cveCount.ToString('N0')) 筆 CVE" -ForegroundColor Gray
+
+    $cs  = "Data Source=$([IO.Path]::GetFullPath($DbPath));Read Only=True"
+    $con = New-Object System.Data.SQLite.SQLiteConnection($cs)
+    $con.Open()
+    $results = [System.Collections.Generic.List[object]]::new()
+
+    foreach ($prog in $Programs) {
+        $name    = Nz $prog.'名稱 / Name'
+        $version = Nz $prog.'版本 / Version'
+        $kw      = _Normalize-CpeName $name
+        if ($kw.Length -lt 3) { continue }
+
+        $cmd = $con.CreateCommand()
+        $cmd.CommandText = @"
+SELECT c.id, c.score, c.severity, c.description,
+       a.version_exact, a.version_start, a.version_end
+FROM   affected a
+JOIN   cve c ON a.cve_id = c.id
+WHERE  a.product_norm = @kw
+  AND  (c.score IS NULL OR c.score >= @ms)
+  AND  (a.target_sw IS NULL OR a.target_sw IN ('*', '-', '') OR a.target_sw LIKE 'windows%')
+ORDER  BY c.score DESC
+"@
+        $null = $cmd.Parameters.AddWithValue('@kw', $kw)
+        $null = $cmd.Parameters.AddWithValue('@ms', 0.0)
+
+        $rdr  = $cmd.ExecuteReader()
+        $seen = [System.Collections.Generic.HashSet[string]]::new()
+        while ($rdr.Read()) {
+            $cid = $rdr.GetString(0)
+            if ($seen.Contains($cid)) { continue }
+            $ex  = if ($rdr.IsDBNull(4)) { '' } else { $rdr.GetString(4) }
+            $vs  = if ($rdr.IsDBNull(5)) { '' } else { $rdr.GetString(5) }
+            $ve  = if ($rdr.IsDBNull(6)) { '' } else { $rdr.GetString(6) }
+            if (-not (_Test-CveVersionInRange $version $ex $vs $ve)) { continue }
+            $null = $seen.Add($cid)
+
+            $score = if ($rdr.IsDBNull(1)) { 'N/A' } else { $rdr.GetDouble(1) }
+            $sev   = if ($rdr.IsDBNull(2)) { 'N/A' } else { $rdr.GetString(2) }
+            $desc  = if ($rdr.IsDBNull(3)) { '' }    else { $rdr.GetString(3) }
+            if ($desc.Length -gt 300) { $desc = $desc.Substring(0, 300) }
+            $p = @()
+            if ($vs) { $p += ">= $vs" }
+            if ($ve) { $p += "< $ve" }
+            $range = if ($ex -and $ex -notin @('*', '-', '')) { "= $ex" }
+                     elseif ($p) { $p -join ' 且 ' }
+                     else { '所有版本' }
+
+            $results.Add([PSCustomObject]@{
+                '軟體名稱 / Software'    = $name
+                '已安裝版本 / Version'   = $version
+                'CVE ID'                 = $cid
+                'CVSS 分數 / Score'      = $score
+                '嚴重等級 / Severity'    = $sev
+                '受影響版本範圍 / Range' = $range
+                '描述 / Description'     = $desc
+            })
+        }
+        $rdr.Close()
+    }
+    $con.Close()
+
+    return @($results | Sort-Object {
+        $s = $_.'CVSS 分數 / Score'
+        if ($s -is [double]) { $s } else { 0.0 }
+    } -Descending)
+}
+
+function New-CveHtmlSection {
+    param([object[]]$CveData)
+    $_SEV_ROW   = @{ CRITICAL='severity-critical'; HIGH='severity-high'; MEDIUM='severity-medium'; LOW='severity-low' }
+    $_SEV_BADGE = @{ CRITICAL='bg-danger'; HIGH='bg-warning text-dark'; MEDIUM='bg-info text-dark'; LOW='bg-success' }
+    $headers = @('軟體名稱 / Software','已安裝版本 / Version','CVE ID','CVSS 分數 / Score','嚴重等級 / Severity','受影響版本範圍 / Range','描述 / Description')
+
+    $sb = New-Object System.Text.StringBuilder
+    $null = $sb.Append('<div class="section" id="cve"><h2>CVE 風險掃描結果</h2>')
+
+    if (-not $CveData -or $CveData.Count -eq 0) {
+        $null = $sb.Append('<div class="alert alert-secondary">未偵測到 CVE 風險，或 NVD 資料庫尚未建立。<br>請先執行 <code>python nvdIndexer.py</code> 建立索引後重新執行。</div></div>')
+        return $sb.ToString()
+    }
+
+    # Severity badge summary
+    $counts = @{ CRITICAL=0; HIGH=0; MEDIUM=0; LOW=0 }
+    foreach ($r in $CveData) {
+        $s = (Nz $r.'嚴重等級 / Severity').ToUpper()
+        if ($counts.ContainsKey($s)) { $counts[$s]++ }
+    }
+    $null = $sb.Append('<p>')
+    foreach ($sev in 'CRITICAL','HIGH','MEDIUM','LOW') {
+        if ($counts[$sev] -gt 0) {
+            $bc = $_SEV_BADGE[$sev]
+            $null = $sb.Append("<span class='badge $bc me-2'>${sev}: $($counts[$sev])</span>")
+        }
+    }
+    $null = $sb.Append("<small class='text-muted'>共 $($CveData.Count) 筆</small></p>")
+
+    # Table
+    $null = $sb.Append('<div class="table-responsive"><table id="cve" class="table table-bordered table-sm"><thead class="table-dark"><tr>')
+    $ci = 0
+    foreach ($h in $headers) {
+        $null = $sb.Append("<th onclick=`"sortTable('cve',$ci)`">$(Esc $h)</th>")
+        $ci++
+    }
+    $null = $sb.Append('</tr></thead><tbody>')
+    foreach ($row in $CveData) {
+        $sev = (Nz $row.'嚴重等級 / Severity').ToUpper()
+        $rc  = if ($_SEV_ROW.ContainsKey($sev)) { $_SEV_ROW[$sev] } else { '' }
+        $null = $sb.Append("<tr class='$rc'>")
+        foreach ($h in $headers) {
+            $null = $sb.Append("<td>$(Esc (Nz $row.$h))</td>")
+        }
+        $null = $sb.Append('</tr>')
+    }
+    $null = $sb.Append('</tbody></table></div></div>')
+    return $sb.ToString()
+}
+
 # ===========================================================================
 # HTML Report Builder
 # ===========================================================================
@@ -450,21 +550,23 @@ function New-HtmlReport {
         [object[]]$Programs,
         [object[]]$Users,
         [object[]]$Policy,
-        [object[]]$Network
+        [object[]]$Network,
+        [object[]]$CveData = @()
     )
 
     $scanTime = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
     $platform = if ($IsWin) { 'Windows' } else { 'Linux' }
     $avLabel  = if ($IsWin) { 'Windows Defender' } else { '防毒資訊 / Antivirus' }
 
-    $s1 = To-HtmlSection -Title '系統基本資訊 / System Info'  -Data $SysInfo   -Id 'sysinfo'
-    $s2 = To-HtmlSection -Title '作業系統詳細 / OS Details'   -Data $OsInfo    -Id 'osdetail'
-    $s3 = To-HtmlSection -Title $avLabel                       -Data $AV        -Id 'antivirus'
-    $s4 = To-HtmlSection -Title '已安裝更新 / Updates'        -Data $Updates   -Id 'updates'
-    $s5 = To-HtmlSection -Title '已安裝程式 / Programs'       -Data $Programs  -Id 'programs'
-    $s6 = To-HtmlSection -Title '使用者帳號 / Users'          -Data $Users     -Id 'users'
-    $s7 = To-HtmlSection -Title '密碼原則 / Password Policy'  -Data $Policy    -Id 'policy'
-    $s8 = To-HtmlSection -Title '網路設定 / Network'          -Data $Network   -Id 'network'
+    $s1 = To-HtmlSection   -Title '系統資訊'          -Data $SysInfo   -Id 'system_info'
+    $s2 = To-HtmlSection   -Title '作業系統詳細'        -Data $OsInfo    -Id 'osdetail'
+    $s3 = To-HtmlSection   -Title $avLabel                -Data $AV        -Id 'defender'
+    $s4 = To-HtmlSection   -Title '已安裝更新'          -Data $Updates   -Id 'updates'
+    $s5 = To-HtmlSection   -Title '已安裝程式'          -Data $Programs  -Id 'programs'
+    $s6 = To-HtmlSection   -Title '使用者帳號'          -Data $Users     -Id 'users'
+    $s7 = To-HtmlSection   -Title '密碼原則'          -Data $Policy    -Id 'policy'
+    $s8 = To-HtmlSection   -Title '網路設定'          -Data $Network   -Id 'network'
+    $s9 = New-CveHtmlSection -CveData $CveData
 
     $titleEsc = Esc "$ComputerName ($LocalIP)"
 
@@ -474,36 +576,41 @@ function New-HtmlReport {
         '<head>'
         '<meta charset="UTF-8">'
         '<meta name="viewport" content="width=device-width, initial-scale=1.0">'
-        "<title>System Report - $titleEsc</title>"
+        "<title>系統資訊報告 - $titleEsc</title>"
         '<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">'
         '<style>'
         'body { padding-top: 4.5rem; }'
         '.section { margin-bottom: 40px; }'
         'th { cursor: pointer; user-select: none; }'
+        '.severity-critical { background-color: #f8d7da !important; }'
+        '.severity-high     { background-color: #fff3cd !important; }'
+        '.severity-medium   { background-color: #cff4fc !important; }'
+        '.severity-low      { background-color: #d1e7dd !important; }'
         '</style>'
         '</head>'
         '<body>'
-        '<nav class="navbar navbar-expand-lg navbar-dark bg-dark fixed-top">'
+        '<nav class="navbar navbar-expand-lg navbar-light bg-light fixed-top">'
         '  <div class="container-fluid">'
-        '    <a class="navbar-brand" href="#">System Info Report</a>'
+        '    <a class="navbar-brand" href="#">系統資訊報告</a>'
         '    <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navMenu"><span class="navbar-toggler-icon"></span></button>'
         '    <div class="collapse navbar-collapse" id="navMenu">'
         '      <ul class="navbar-nav me-auto">'
-        '        <li class="nav-item"><a class="nav-link" href="#sysinfo">System</a></li>'
-        '        <li class="nav-item"><a class="nav-link" href="#osdetail">OS</a></li>'
-        '        <li class="nav-item"><a class="nav-link" href="#antivirus">Antivirus</a></li>'
-        '        <li class="nav-item"><a class="nav-link" href="#updates">Updates</a></li>'
-        '        <li class="nav-item"><a class="nav-link" href="#programs">Programs</a></li>'
-        '        <li class="nav-item"><a class="nav-link" href="#users">Users</a></li>'
-        '        <li class="nav-item"><a class="nav-link" href="#policy">Password Policy</a></li>'
-        '        <li class="nav-item"><a class="nav-link" href="#network">Network</a></li>'
+        '        <li class="nav-item"><a class="nav-link" href="#system_info">系統資訊</a></li>'
+        '        <li class="nav-item"><a class="nav-link" href="#osdetail">作業系統詳細</a></li>'
+        '        <li class="nav-item"><a class="nav-link" href="#defender">Windows Defender</a></li>'
+        '        <li class="nav-item"><a class="nav-link" href="#updates">已安裝更新</a></li>'
+        '        <li class="nav-item"><a class="nav-link" href="#programs">已安裝程式</a></li>'
+        '        <li class="nav-item"><a class="nav-link" href="#users">使用者帳號</a></li>'
+        '        <li class="nav-item"><a class="nav-link" href="#policy">密碼原則</a></li>'
+        '        <li class="nav-item"><a class="nav-link" href="#network">網路設定</a></li>'
+        '        <li class="nav-item"><a class="nav-link" href="#cve">CVE 風險</a></li>'
         '      </ul>'
         '    </div>'
         '  </div>'
         '</nav>'
         '<div class="container">'
-        '<h1 class="mb-2 mt-4">System Info Report</h1>'
-        "<p class=`"text-muted`">Host: <strong>$(Esc $ComputerName)</strong> | IP: <strong>$(Esc $LocalIP)</strong> | Scanned: $scanTime | Platform: $platform</p>"
+        '<h1 class="mb-4">系統資訊報告</h1>'
+        "<p><strong>電腦名稱：</strong>$(Esc $ComputerName)<br><strong>區網 IP：</strong>$(Esc $LocalIP)</p>"
         $s1
         $s2
         $s3
@@ -512,6 +619,7 @@ function New-HtmlReport {
         $s6
         $s7
         $s8
+        $s9
         '</div>'
         '<script>'
         'function sortTable(id,ci){'
@@ -560,10 +668,34 @@ $updates  = Get-InstalledUpdates
 Write-Host "  Done: Updates"
 $programs = Get-InstalledPrograms
 Write-Host "  Done: Programs"
+
+$latestMap = Get-LatestVersions -Programs $programs
+Write-Host "  Done: 最新版本查詢（Repology）"
+foreach ($p in $programs) {
+    $dn = Nz $p.'名稱 / Name'
+    $latest = if ($latestMap.ContainsKey($dn)) { $latestMap[$dn] } else { '' }
+    $p | Add-Member -MemberType NoteProperty -Name '最新版本 / Latest' -Value $latest -Force
+}
 $users    = Get-LocalUserAccounts
 $policy   = Get-PasswordPolicy
 $network  = Get-NetworkSettings
 Write-Host "  Done: Network"
+
+# NVD 資料庫更新（直接呼叫 NvdLib 函式）
+$nvdDbPath = Join-Path (Split-Path $scriptDir -Parent) "python\cveScanner\nvd_cache.db"
+Write-Host '  更新 NVD 資料庫...' -ForegroundColor Cyan
+if (Initialize-SQLiteLib) {
+    $null = Invoke-NvdDownload -DownloadYears @((Get-Date).Year) -DbPath $nvdDbPath -DoReset $false
+    $nvdInitStats = Get-NvdDbStats $nvdDbPath
+    Write-Host "  NVD 資料庫：$($nvdInitStats.cveCount.ToString('N0')) CVEs / $($nvdInitStats.affectedCount.ToString('N0')) 受影響記錄"
+} else {
+    Write-Host '  SQLite 無法載入，略過 NVD 更新。' -ForegroundColor Yellow
+}
+
+# CVE 風險掃描（原生 SQLite，不需要 Python）
+Write-Host '  CVE 風險掃描中...' -ForegroundColor Cyan
+$cveResults = Get-CveResults -Programs $programs -DbPath $nvdDbPath
+Write-Host "  Done: CVE（$($cveResults.Count) 筆）" -ForegroundColor $(if ($cveResults.Count) {'Yellow'} else {'Green'})
 
 $html = New-HtmlReport `
     -ComputerName $computerName `
@@ -575,7 +707,8 @@ $html = New-HtmlReport `
     -Programs     $programs `
     -Users        $users `
     -Policy       $policy `
-    -Network      $network
+    -Network      $network `
+    -CveData      $cveResults
 
 $htmlFile = Join-Path $outDir "${baseName}.html"
 [System.IO.File]::WriteAllText($htmlFile, $html, [System.Text.Encoding]::UTF8)
@@ -586,14 +719,15 @@ Write-Host "  Exporting CSV..." -ForegroundColor Cyan
 $csvEnc = if ($PSVersionTable.PSVersion.Major -ge 6) { 'utf8BOM' } else { 'UTF8' }
 $noData = @([PSCustomObject]@{ 'Info' = 'No data' })
 $csvSets = @(
-    @{ Name = 'SystemInfo';      Data = $sysInfo  }
-    @{ Name = 'OSDetails';       Data = $osInfo   }
-    @{ Name = 'Antivirus';       Data = $avInfo   }
-    @{ Name = 'Updates';         Data = $updates  }
-    @{ Name = 'Programs';        Data = $programs }
-    @{ Name = 'UserAccounts';    Data = $users    }
-    @{ Name = 'PasswordPolicy';  Data = $policy   }
-    @{ Name = 'NetworkSettings'; Data = $network  }
+    @{ Name = 'SystemInfo';      Data = $sysInfo     }
+    @{ Name = 'OSDetails';       Data = $osInfo      }
+    @{ Name = 'Antivirus';       Data = $avInfo      }
+    @{ Name = 'Updates';         Data = $updates     }
+    @{ Name = 'Programs';        Data = $programs    }
+    @{ Name = 'UserAccounts';    Data = $users       }
+    @{ Name = 'PasswordPolicy';  Data = $policy      }
+    @{ Name = 'NetworkSettings'; Data = $network     }
+    @{ Name = 'CVERisk';         Data = $cveResults  }
 )
 foreach ($ds in $csvSets) {
     $csvFile = Join-Path $outDir "${baseName}_$($ds.Name).csv"
@@ -602,6 +736,33 @@ foreach ($ds in $csvSets) {
 }
 Write-Host "  Done: CSV exported" -ForegroundColor Green
 
+# CPE 2.3 清單（VANS 需求）
+Write-Host '  產生 CPE 2.3 清單 (VANS)...' -ForegroundColor Cyan
+$cpe23Path = Join-Path $outDir "${baseName}_CPE23.txt"
+Export-Cpe23 -Programs $programs -OutPath $cpe23Path
+Write-Host "  Done: CPE 2.3" -ForegroundColor Green
+
 # ZIP
 Compress-Archive -Path "$outDir\*" -DestinationPath $zipPath -Force
 Write-Host "Zipped to $zipPath" -ForegroundColor Green
+
+# 獨立 CVE 風險報告（HTML + CSV）
+Write-Host ''
+Write-Host '  生成獨立 CVE 風險報告...' -ForegroundColor Cyan
+if ((Test-Path $nvdDbPath) -and (Initialize-SQLiteLib)) {
+    $cveDetailResults = Invoke-CveScan -Programs $programs -DbPath $nvdDbPath
+    $dbStatsFull      = Get-NvdDbStats $nvdDbPath
+    if ($cveDetailResults.Count -gt 0) {
+        $uniqueNames = @($cveDetailResults | ForEach-Object { $_.'軟體名稱 / Software' } | Select-Object -Unique)
+        $latestMapCve = Get-LatestVersions -Programs ($uniqueNames | ForEach-Object { [PSCustomObject]@{ '名稱 / Name' = $_ } })
+        foreach ($r in $cveDetailResults) {
+            $r.'最新版本 / Latest' = if ($latestMapCve.ContainsKey([string]$r.'軟體名稱 / Software')) { $latestMapCve[[string]$r.'軟體名稱 / Software'] } else { '' }
+        }
+    }
+    Export-CveCsv  -Results $cveDetailResults -OutPath (Join-Path $outDir "${baseName}_CVE.csv")
+    Export-CveHtml -Results $cveDetailResults -ComputerName $computerName -LocalIp $localIP `
+                   -DbStats $dbStatsFull -OutPath (Join-Path $outDir "${baseName}_CVE.html")
+    Write-Host "  完成！CVE HTML：$(Join-Path $outDir "${baseName}_CVE.html")" -ForegroundColor Green
+} else {
+    Write-Host '  NVD 資料庫不存在或 SQLite 無法載入，略過獨立 CVE 報告。' -ForegroundColor Yellow
+}
