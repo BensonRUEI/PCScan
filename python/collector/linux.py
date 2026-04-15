@@ -66,6 +66,7 @@ def get_installed_updates() -> list[dict]:
                         "動作 / Action":      parts[2],
                         "套件 / Package":     parts[3],
                     })
+        entries = list(reversed(entries[-10:])) if entries else []
         return entries or [{"日期 / Date": "無記錄 / No records", "時間 / Time": "",
                             "動作 / Action": "", "套件 / Package": ""}]
 
@@ -74,7 +75,7 @@ def get_installed_updates() -> list[dict]:
     if yumOut:
         lines = [l for l in yumOut.splitlines() if re.match(r"^\s*\d+", l)]
         entries = []
-        for line in lines[:50]:   # 最多取 50 筆
+        for line in lines[:10]:   # 最近 10 筆
             parts = line.split("|")
             if len(parts) >= 4:
                 entries.append({

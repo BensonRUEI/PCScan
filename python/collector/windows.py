@@ -71,7 +71,7 @@ ConvertTo-Json
 # ---------------------------------------------------------------------------
 
 def get_installed_updates() -> list[dict]:
-    """取得 Windows 已安裝 Hotfix 清單，回傳 list[dict]。"""
+    """取得 Windows 已安裝 Hotfix 清單，依日期降序回傳最近 10 筆。"""
     psCmd = r"""
 Get-WmiObject Win32_QuickFixEngineering |
 Select-Object HotFixID,Description,InstalledOn |
@@ -82,8 +82,21 @@ ConvertTo-Json
         "Description": "描述 / Description",
         "InstalledOn": "安裝日期 / InstalledOn",
     }
+    from datetime import datetime as _dt
     data = _parse_ps_json(_run_powershell(psCmd), [])
-    return [{_KEY_MAP.get(k, k): v for k, v in item.items()} for item in data]
+    rows = [{_KEY_MAP.get(k, k): v for k, v in item.items()} for item in data]
+
+    def _parseDate(row):
+        val = str(row.get("安裝日期 / InstalledOn") or "")
+        for fmt in ("%m/%d/%Y", "%Y/%m/%d", "%Y-%m-%d", "%d/%m/%Y"):
+            try:
+                return _dt.strptime(val, fmt)
+            except ValueError:
+                continue
+        return _dt.min
+
+    rows.sort(key=_parseDate, reverse=True)
+    return rows[:10]
 
 
 # ---------------------------------------------------------------------------
